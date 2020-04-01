@@ -32,7 +32,7 @@ import (
 	"github.com/kubernetes-up-and-running/kuard/pkg/htmlutils"
 	"github.com/kubernetes-up-and-running/kuard/pkg/keygen"
 	"github.com/kubernetes-up-and-running/kuard/pkg/memory"
-	"github.com/kubernetes-up-and-running/kuard/pkg/memq/server"
+	memqserver "github.com/kubernetes-up-and-running/kuard/pkg/memq/server"
 	"github.com/kubernetes-up-and-running/kuard/pkg/sitedata"
 	"github.com/kubernetes-up-and-running/kuard/pkg/version"
 
@@ -66,6 +66,7 @@ func loggingMiddleware(handler http.Handler) http.Handler {
 }
 
 type pageContext struct {
+	URLBase      string       `json:"urlBase"`
 	Hostname     string       `json:"hostname"`
 	Addrs        []string     `json:"addrs"`
 	Version      string       `json:"version"`
@@ -80,15 +81,19 @@ type App struct {
 	tg *htmlutils.TemplateGroup
 
 	m     *memory.MemoryAPI
-	kg    *keygen.KeyGen
 	live  *debugprobe.Probe
 	ready *debugprobe.Probe
+	env   *env.Env
+	dns   *dnsapi.DNSAPI
+	kg    *keygen.KeyGen
+	mq    *memqserver.Server
 
 	r *httprouter.Router
 }
 
-func (k *App) getPageContext(r *http.Request) *pageContext {
+func (k *App) getPageContext(r *http.Request, urlBase string) *pageContext {
 	c := &pageContext{}
+	c.URLBase = urlBase
 	c.Hostname, _ = os.Hostname()
 
 	addrs, _ := net.InterfaceAddrs()
@@ -112,8 +117,10 @@ func (k *App) getPageContext(r *http.Request) *pageContext {
 	return c
 }
 
-func (k *App) rootHandler(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	k.tg.Render(w, "index.html", k.getPageContext(r))
+func (k *App) getRootHandler(urlBase string) httprouter.Handle {
+	return httprouter.Handle(func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+		k.tg.Render(w, "index.html", k.getPageContext(r, urlBase))
+	})
 }
 
 // Exists reports whether the named file or directory exists.
@@ -151,33 +158,39 @@ func NewApp() *App {
 		r:  httprouter.New(),
 	}
 
+	// Init all of the subcomponents
+
 	router := k.r
+	k.m = memory.New()
+	k.live = debugprobe.New()
+	k.ready = debugprobe.New()
+	k.env = env.New()
+	k.dns = dnsapi.New()
+	k.kg = keygen.New()
+	k.mq = memqserver.NewServer()
 
-	// Add the root handler
-	router.GET("/", k.rootHandler)
-	router.GET("/-/*path", k.rootHandler)
+	// Add handlers
+	for _, prefix := range []string{"", "/a", "/b", "/c"} {
+		rootHandler := k.getRootHandler(prefix)
+		router.GET(prefix+"/", rootHandler)
+		router.GET(prefix+"/-/*path", rootHandler)
 
-	router.Handler("GET", "/metrics", prometheus.Handler())
+		router.Handler("GET", prefix+"/metrics", prometheus.Handler())
 
-	// Add the static files
-	sitedata.AddRoutes(router, "/built")
-	sitedata.AddRoutes(router, "/static")
+		// Add the static files
+		sitedata.AddRoutes(router, prefix+"/built")
+		sitedata.AddRoutes(router, prefix+"/static")
 
-	router.Handler("GET", "/fs/*filepath", http.StripPrefix("/fs", http.FileServer(http.Dir("/"))))
+		router.Handler("GET", prefix+"/fs/*filepath", http.StripPrefix(prefix+"/fs", http.FileServer(http.Dir("/"))))
 
-	k.m = memory.New("/mem")
-	k.m.AddRoutes(router)
-	k.live = debugprobe.New("/healthy")
-	k.live.AddRoutes(router)
-	k.ready = debugprobe.New("/ready")
-	k.ready.AddRoutes(router)
-	env.New("/env").AddRoutes(router)
-	dnsapi.New("/dns").AddRoutes(router)
-
-	k.kg = keygen.New("/keygen")
-	k.kg.AddRoutes(router)
-
-	memqserver.NewServer("/memq/server").AddRoutes(router)
+		k.m.AddRoutes(router, prefix+"/mem")
+		k.live.AddRoutes(router, prefix+"/healthy")
+		k.ready.AddRoutes(router, prefix+"/ready")
+		k.env.AddRoutes(router, prefix+"/env")
+		k.dns.AddRoutes(router, prefix+"/dns")
+		k.kg.AddRoutes(router, prefix+"/keygen")
+		k.mq.AddRoutes(router, prefix+"/memq/server")
+	}
 
 	return k
 }
